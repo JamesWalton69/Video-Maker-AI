@@ -1,0 +1,731 @@
+"""
+VideoMaker - Auto Video Generator
+----------------------------------
+1. Reads audio from /audio folder
+2. Uses Whisper to auto-generate SRT captions with timestamps
+3. Matches each caption to a numbered image in /images folder
+4. Renders final video synced to audio → saved in /output folder
+"""
+
+import os
+import sys
+import argparse
+import platform
+from pathlib import Path
+from tqdm import tqdm
+from PIL import Image, ImageDraw, ImageFont
+import whisper
+import numpy as np
+from moviepy import (
+    ImageClip, AudioFileClip, concatenate_videoclips, vfx, VideoClip
+)
+
+# ── Folder paths (all relative to this script) ────────────────────────────────
+BASE         = Path(__file__).parent
+AUDIO_DIR    = BASE / "audio"
+IMAGES_DIR   = BASE / "images"
+CAPTIONS_DIR = BASE / "captions"
+OUTPUT_DIR   = BASE / "output"
+
+# Add local tools directory to PATH so FFmpeg is always found
+tools_dir = str(BASE / "tools")
+os.environ["PATH"] = tools_dir + os.pathsep + os.environ["PATH"]
+
+# ── Default Settings ──────────────────────────────────────────────────────────
+WHISPER_MODEL  = "turbo"       # Options: tiny, base, small, medium, large, turbo
+VIDEO_SIZE     = (1920, 1080)  # Output resolution (Width, Height)
+FPS            = 24
+FADE_DURATION  = 0.3           # Seconds of crossfade between images (0 = none)
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def find_audio_file():
+    """Find the first audio file in the audio folder."""
+    for ext in ["*.mp3", "*.wav", "*.m4a", "*.aac", "*.flac", "*.ogg"]:
+        files = list(AUDIO_DIR.glob(ext))
+        if files:
+            return files[0]
+    return None
+
+
+def parse_srt_time(t):
+    """Convert SRT timestamp string to seconds."""
+    h, m, rest = t.strip().split(":")
+    s, ms = rest.replace(",", ".").split(".")
+    return int(h)*3600 + int(m)*60 + int(s) + float("0." + ms)
+
+
+def parse_srt(srt_path):
+    """Parse SRT file into list of (start, end, text) tuples."""
+    entries = []
+    with open(srt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    blocks = content.strip().split("\n\n")
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 3:
+            continue
+        try:
+            times = lines[1].split(" --> ")
+            start = parse_srt_time(times[0])
+            end   = parse_srt_time(times[1])
+            text  = " ".join(lines[2:]).strip()
+            entries.append((start, end, text))
+        except Exception:
+            continue
+    return entries
+
+
+def transcribe_audio(audio_path, model_name=WHISPER_MODEL):
+    """Run Whisper on the audio file and save SRT to captions folder."""
+    srt_path = CAPTIONS_DIR / (audio_path.stem + ".srt")
+
+    if srt_path.exists():
+        print(f"[OK] Found existing SRT: {srt_path.name} — skipping transcription.")
+        return srt_path
+
+    print(f"\n[Whisper] Loading model '{model_name}'... (first run downloads it)")
+    model = whisper.load_model(model_name)
+
+    print(f"[Whisper] Transcribing: {audio_path.name}")
+    result = model.transcribe(str(audio_path), word_timestamps=False)
+
+    # Write SRT
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(result["segments"], 1):
+            start = seg["start"]
+            end   = seg["end"]
+            text  = seg["text"].strip()
+
+            def fmt(s):
+                h = int(s // 3600)
+                m = int((s % 3600) // 60)
+                sec = int(s % 60)
+                ms = int(round((s - int(s)) * 1000))
+                return f"{h:02}:{m:02}:{sec:02},{ms:03}"
+
+            f.write(f"{i}\n{fmt(start)} --> {fmt(end)}\n{text}\n\n")
+
+    print(f"[OK] SRT saved -> {srt_path}")
+    return srt_path
+
+
+def get_sorted_images():
+    """Get all images from /images sorted by filename."""
+    exts = [".png", ".jpg", ".jpeg", ".webp"]
+    files = [
+        f for f in sorted(IMAGES_DIR.iterdir())
+        if f.suffix.lower() in exts
+    ]
+    return files
+
+
+def wrap_text(text, font, max_width):
+    """Wrap text to fit within max_width pixels using PIL font."""
+    words = text.split()
+    lines = []
+    current_line = []
+    
+    for word in words:
+        test_line = " ".join(current_line + [word])
+        try:
+            bbox = font.getbbox(test_line)
+            w = bbox[2] - bbox[0]
+        except AttributeError:
+            w, h = font.getsize(test_line)
+            
+        if w <= max_width:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+            
+    if current_line:
+        lines.append(" ".join(current_line))
+    return lines
+
+
+def draw_subtitles(canvas, text, font_size=42, bottom_padding=80):
+    """Draw subtitles onto the PIL canvas with outline stroke."""
+    draw = ImageDraw.Draw(canvas)
+    
+    # Choose standard font based on platform
+    font_path = "arial.ttf"
+    if platform.system() == "Windows":
+        font_path = r"C:\Windows\Fonts\arial.ttf"
+    elif platform.system() == "Darwin":
+        font_path = "/Library/Fonts/Arial.ttf"
+    else:
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except Exception:
+        try:
+            # Fallback to standard arial
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+            
+    # Wrap text to fit screen width (leave 120px margin on sides)
+    max_text_width = canvas.width - 240
+    lines = wrap_text(text, font, max_text_width)
+    
+    # Calculate text heights and coordinates
+    line_heights = []
+    for line in lines:
+        try:
+            bbox = font.getbbox(line)
+            line_heights.append(bbox[3] - bbox[1])
+        except AttributeError:
+            _, h = font.getsize(line)
+            line_heights.append(h)
+            
+    total_text_height = sum(line_heights) + (12 * (len(lines) - 1))
+    y = canvas.height - bottom_padding - total_text_height
+    
+    for line in lines:
+        try:
+            bbox = font.getbbox(line)
+            line_w = bbox[2] - bbox[0]
+            line_h = bbox[3] - bbox[1]
+        except AttributeError:
+            line_w, line_h = font.getsize(line)
+            
+        x = (canvas.width - line_w) // 2
+        
+        # Draw text with 4px black outline (native in newer PIL versions)
+        try:
+            draw.text((x, y), line, font=font, fill=(255, 255, 255), 
+                      stroke_width=4, stroke_fill=(0, 0, 0))
+        except Exception:
+            # Manual outline fallback
+            for dx in [-2, 0, 2]:
+                for dy in [-2, 0, 2]:
+                    if dx != 0 or dy != 0:
+                        draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0))
+            draw.text((x, y), line, font=font, fill=(255, 255, 255))
+            
+        y += line_h + 12
+
+
+def resize_image(img_path, size, subtitle_text=None):
+    """Resize image to fit target size with letterboxing, and optionally draw subtitles."""
+    img = Image.open(img_path).convert("RGB")
+    img.thumbnail(size, Image.LANCZOS)
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    offset = ((size[0] - img.width) // 2, (size[1] - img.height) // 2)
+    canvas.paste(img, offset)
+    
+    if subtitle_text:
+        draw_subtitles(canvas, subtitle_text)
+        
+    tmp_path = BASE / "tools" / f"_tmp_{img_path.stem}.jpg"
+    canvas.save(tmp_path, "JPEG", quality=95)
+    return str(tmp_path)
+
+
+def resize_image_base(img_path, size):
+    """Resize image to fit target size with letterboxing, returning PIL Image canvas."""
+    img = Image.open(img_path).convert("RGB")
+    img.thumbnail(size, Image.LANCZOS)
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    offset = ((size[0] - img.width) // 2, (size[1] - img.height) // 2)
+    canvas.paste(img, offset)
+    return canvas
+
+
+def draw_highlighted_subtitles(canvas, words_info, curr_time, font_size=42, bottom_padding=80):
+    """Draws subtitles on canvas with the active word highlighted in yellow, other words in white, with black outline."""
+    draw = ImageDraw.Draw(canvas)
+    
+    # Choose standard font based on platform
+    font_path = "arial.ttf"
+    if platform.system() == "Windows":
+        font_path = r"C:\Windows\Fonts\arial.ttf"
+    elif platform.system() == "Darwin":
+        font_path = "/Library/Fonts/Arial.ttf"
+    else:
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except Exception:
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+    # Layout calculation
+    max_text_width = canvas.width - 240
+    
+    # Get space width
+    try:
+        bbox = font.getbbox(" ")
+        space_width = bbox[2] - bbox[0]
+    except AttributeError:
+        space_width = font.getsize(" ")[0]
+        
+    lines = []
+    current_line = []
+    current_width = 0
+    
+    for word_dict in words_info:
+        word = word_dict["word"].strip()
+        if not word:
+            continue
+        try:
+            bbox = font.getbbox(word)
+            word_w = bbox[2] - bbox[0]
+            word_h = bbox[3] - bbox[1]
+        except AttributeError:
+            word_w, word_h = font.getsize(word)
+            
+        if current_width + word_w > max_text_width:
+            if current_line:
+                lines.append(current_line)
+            current_line = [(word_dict, word_w, word_h)]
+            current_width = word_w
+        else:
+            current_line.append((word_dict, word_w, word_h))
+            current_width += word_w + space_width
+            
+    if current_line:
+        lines.append(current_line)
+        
+    if not lines:
+        return
+        
+    # Calculate vertical position
+    line_heights = []
+    for line in lines:
+        line_height = max(w[2] for w in line)
+        line_heights.append(line_height)
+        
+    total_text_height = sum(line_heights) + (12 * (len(lines) - 1))
+    y = canvas.height - bottom_padding - total_text_height
+    
+    # Draw word by word
+    for line_idx, line in enumerate(lines):
+        line_w = sum(w[1] for w in line) + space_width * (len(line) - 1)
+        x = (canvas.width - line_w) // 2
+        line_h = line_heights[line_idx]
+        
+        for word_dict, word_w, word_h in line:
+            word = word_dict["word"]
+            start = word_dict["start"]
+            end = word_dict["end"]
+            
+            # Highlight if current time is within the word's time range
+            if start <= curr_time <= end:
+                fill_color = (255, 255, 0) # Highlight yellow
+            else:
+                fill_color = (255, 255, 255) # Default white
+                
+            # Draw text with outline
+            try:
+                draw.text((x, y), word, font=font, fill=fill_color,
+                          stroke_width=4, stroke_fill=(0, 0, 0))
+            except Exception:
+                for dx in [-2, 0, 2]:
+                    for dy in [-2, 0, 2]:
+                        if dx != 0 or dy != 0:
+                            draw.text((x + dx, y + dy), word, font=font, fill=(0, 0, 0))
+                draw.text((x, y), word, font=font, fill=fill_color)
+                
+            x += word_w + space_width
+            
+        y += line_h + 12
+
+
+def clean_text(text):
+    import re
+    # Lowercase, remove punctuation and extra spaces
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    return " ".join(text.split())
+
+def parse_scene_number(line):
+    import re
+    # Look for patterns like "Scene 1", "Scene01", "Scene: 1", "Scene-1", "Scene - 1", "1.", "[1]", etc.
+    match = re.search(r'\bscene\s*[:\-#]?\s*(\d+)', line, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.match(r'^\s*(\d+)\s*[:\.\-]', line)
+    if match:
+        return int(match.group(1))
+    return None
+
+def match_segments_to_script(srt_entries, script_lines):
+    """Matches each SRT entry to a script line index (0-based) based on text similarity."""
+    from difflib import SequenceMatcher
+    matched_indices = []
+    clean_lines = [clean_text(line) for line in script_lines]
+    
+    current_line_idx = 0
+    
+    for entry_idx, (start, end, text) in enumerate(srt_entries):
+        clean_entry = clean_text(text)
+        if not clean_entry:
+            matched_indices.append(current_line_idx)
+            continue
+            
+        best_score = -999999
+        best_idx = current_line_idx
+        
+        # Search all lines but apply sequence penalties
+        for idx in range(len(script_lines)):
+            line = clean_lines[idx]
+            if not line:
+                continue
+                
+            entry_words = set(clean_entry.split())
+            line_words = set(line.split())
+            overlap = len(entry_words.intersection(line_words))
+            
+            ratio = SequenceMatcher(None, clean_entry, line).ratio()
+            
+            score = overlap * 10.0 + ratio * 5.0
+            
+            # Sequential penalty
+            distance = abs(idx - current_line_idx)
+            if idx < current_line_idx:
+                score -= distance * 15.0  # Strong penalty for going backward
+            else:
+                score -= distance * 2.0   # Mild penalty for skipping forward
+                
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+                
+        matched_indices.append(best_idx)
+        current_line_idx = best_idx
+        
+    return matched_indices
+
+def assign_timestamps_to_lines(script_lines, srt_entries, matched_indices, total_duration):
+    N = len(script_lines)
+    line_times = [[None, None] for _ in range(N)]
+    
+    # Assign from matched segments
+    for entry_idx, line_idx in enumerate(matched_indices):
+        start, end, _ = srt_entries[entry_idx]
+        if line_times[line_idx][0] is None or start < line_times[line_idx][0]:
+            line_times[line_idx][0] = start
+        if line_times[line_idx][1] is None or end > line_times[line_idx][1]:
+            line_times[line_idx][1] = end
+            
+    # Fill unmatched gaps
+    if line_times[0][0] is None:
+        line_times[0][0] = 0.0
+        
+    for j in range(N):
+        if line_times[j][0] is None:
+            # find previous end
+            prev_end = 0.0
+            for k in range(j - 1, -1, -1):
+                if line_times[k][1] is not None:
+                    prev_end = line_times[k][1]
+                    break
+            
+            # find next start
+            next_start = total_duration
+            for k in range(j + 1, N):
+                if line_times[k][0] is not None:
+                    next_start = line_times[k][0]
+                    break
+                    
+            # find unmatched block count
+            unmatched_count = 0
+            for k in range(j, N):
+                if line_times[k][0] is None:
+                    unmatched_count += 1
+                else:
+                    break
+                    
+            gap_size = max(0.0, next_start - prev_end)
+            step = gap_size / (unmatched_count + 1)
+            
+            for step_idx in range(unmatched_count):
+                curr_idx = j + step_idx
+                line_times[curr_idx][0] = prev_end + step_idx * step
+                line_times[curr_idx][1] = prev_end + (step_idx + 1) * step
+                
+    # Adjust boundaries
+    for j in range(N - 1):
+        if line_times[j][1] > line_times[j+1][0]:
+            mid = (line_times[j][1] + line_times[j+1][0]) / 2
+            line_times[j][1] = mid
+            line_times[j+1][0] = mid
+            
+    # Boundaries cleanup
+    line_times[0][0] = 0.0
+    if line_times[-1][1] < total_duration:
+        line_times[-1][1] = total_duration
+        
+    return line_times
+
+def find_image_for_scene(scene_num, image_files):
+    import re
+    # Match by leading digits in name
+    for img_path in image_files:
+        name = img_path.stem
+        match = re.match(r"^(\d+)", name)
+        if match and int(match.group(1)) == scene_num:
+            return img_path
+            
+    # Match by any number in filename
+    for img_path in image_files:
+        name = img_path.stem
+        numbers = re.findall(r"\d+", name)
+        if numbers and any(int(num) == scene_num for num in numbers):
+            return img_path
+            
+    # Fallback to index-based mapping
+    idx = (scene_num - 1) % len(image_files)
+    return image_files[idx]
+
+
+def build_video(srt_entries, image_files, audio_path, show_subtitles=True, use_zoom=False, video_size=VIDEO_SIZE, fps=FPS, num_threads=0, use_prompt_matching=False, scene_numbers=None):
+    """Build final video: each SRT entry maps to one image."""
+    total_duration = AudioFileClip(str(audio_path)).duration
+
+    print(f"\n[Video] {len(srt_entries)} captions | {len(image_files)} images")
+    print(f"[Video] Subtitles: {'ENABLED' if show_subtitles else 'DISABLED'}")
+    print(f"[Video] Pan & Zoom (Ken Burns): {'ENABLED' if use_zoom else 'DISABLED'}")
+    if use_prompt_matching:
+        print("[Video] Prompt/Scene Number Matching: ENABLED")
+
+    if len(image_files) < len(srt_entries):
+        print(f"[WARNING] Fewer images ({len(image_files)}) than captions ({len(srt_entries)}).")
+        print("          Last image will be reused for remaining captions.")
+
+    clips = []
+    tmp_files = []
+
+    for i, (start, end, text) in enumerate(tqdm(srt_entries, desc="Building clips")):
+        if use_prompt_matching and scene_numbers is not None:
+            scene_num = scene_numbers[i]
+            img_path = find_image_for_scene(scene_num, image_files)
+        else:
+            img_path = image_files[i % len(image_files)]
+            
+        duration = end - start
+
+        if duration <= 0:
+            continue
+
+        # Resize image, burn subtitle text if enabled
+        sub_text = text if show_subtitles else None
+        tmp = resize_image(img_path, video_size, subtitle_text=sub_text)
+        tmp_files.append(tmp)
+
+        clip = (
+            ImageClip(tmp)
+            .with_duration(duration)
+            .with_start(start)
+        )
+
+        # Apply Zoom transition if enabled
+        if use_zoom:
+            # Subtle zoom-in from 1.0 to 1.07 over the clip's duration
+            clip = clip.resized(lambda t, d=duration: 1.0 + 0.07 * (t / d))
+
+        if FADE_DURATION > 0 and duration > FADE_DURATION * 2:
+            clip = clip.with_effects([vfx.CrossFadeIn(FADE_DURATION)])
+
+        clips.append(clip)
+
+    # Handle gap between last caption and end of audio
+    if srt_entries and srt_entries[-1][1] < total_duration:
+        gap = total_duration - srt_entries[-1][1]
+        
+        if use_prompt_matching and scene_numbers is not None:
+            last_img = find_image_for_scene(scene_numbers[-1], image_files)
+        else:
+            last_img = image_files[-1]
+        
+        # No subtitle text on the outro gap
+        tmp = resize_image(last_img, video_size, subtitle_text=None)
+        tmp_files.append(tmp)
+        
+        clip = (
+            ImageClip(tmp)
+            .with_duration(gap)
+            .with_start(srt_entries[-1][1])
+        )
+        if use_zoom:
+            clip = clip.resized(lambda t, d=gap: 1.0 + 0.07 * (t / d))
+            
+        clips.append(clip)
+
+    print("\n[Video] Concatenating clips...")
+    final = concatenate_videoclips(clips, method="compose")
+
+    print("[Audio] Adding audio...")
+    audio = AudioFileClip(str(audio_path))
+    final = final.with_audio(audio)
+
+    output_path = OUTPUT_DIR / (audio_path.stem + "_video.mp4")
+    import multiprocessing
+    cpu_cores = multiprocessing.cpu_count()
+    if num_threads > 0:
+        render_threads = min(num_threads, cpu_cores)
+    else:
+        render_threads = max(1, cpu_cores - 1)
+    
+    print(f"[Render] Rendering -> {output_path.name} (Using {render_threads} CPU threads)")
+    final.write_videofile(
+        str(output_path),
+        fps=fps,
+        codec="libx264",
+        audio_codec="aac",
+        threads=render_threads,
+        logger="bar"
+    )
+
+    # Cleanup temp files
+    for f in tmp_files:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+    print(f"\n[SUCCESS] Done! Video saved -> output/{output_path.name}")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VideoMaker AI - Render Engine")
+    parser.add_argument("--subtitles", action="store_true", default=False, help="Burn subtitles onto the video")
+    parser.add_argument("--no-subtitles", action="store_false", dest="subtitles", help="Do not burn subtitles")
+    parser.set_defaults(subtitles=True) # Default is subtitles enabled
+    
+    parser.add_argument("--zoom", action="store_true", default=False, help="Apply Ken Burns zoom transitions")
+    parser.add_argument("--no-zoom", action="store_false", dest="zoom", help="Do not apply zoom transitions")
+    
+    parser.add_argument("--resolution", type=str, default="1920x1080", help="Output resolution (e.g. 1920x1080 or 1080x1920)")
+    parser.add_argument("--model", type=str, default=WHISPER_MODEL, help="Whisper model to use")
+    parser.add_argument("--threads", type=int, default=0, help="Number of CPU threads for rendering (0 = auto)")
+    
+    parser.add_argument("--prompt-given", action="store_true", default=False, help="Match script lines to image/scene prompts by number")
+    parser.add_argument("--no-prompt-given", action="store_false", dest="prompt_given", help="Do not match script lines to image/scene prompts")
+    parser.set_defaults(prompt_given=False)
+    
+    args = parser.parse_args()
+
+    # Parse resolution
+    try:
+        width, height = map(int, args.resolution.lower().split("x"))
+        video_size = (width, height)
+    except Exception:
+        print(f"[WARNING] Invalid resolution format '{args.resolution}'. Using default 1920x1080.")
+        video_size = VIDEO_SIZE
+
+    # 1. Find audio
+    audio_path = find_audio_file()
+    if not audio_path:
+        print("[ERROR] No audio file found in the 'audio' folder.")
+        print("        Supported formats: mp3, wav, m4a, aac, flac, ogg")
+        sys.exit(1)
+    print(f"[OK] Audio: {audio_path.name}")
+
+    # 2. Find images
+    image_files = get_sorted_images()
+    if not image_files:
+        print("[ERROR] No images found in the 'images' folder.")
+        print("        Supported formats: png, jpg, jpeg, webp")
+        sys.exit(1)
+    print(f"[OK] Images: {len(image_files)} found")
+
+    # 3. Transcribe with Whisper → SRT
+    srt_path = transcribe_audio(audio_path, model_name=args.model)
+
+    # 4. Parse SRT
+    srt_entries = parse_srt(srt_path)
+    if not srt_entries:
+        print("[ERROR] SRT file is empty or couldn't be parsed.")
+        sys.exit(1)
+    print(f"[OK] Captions: {len(srt_entries)} segments")
+
+    # Check if we should match script lines to image/scene prompts
+    use_prompt_matching = False
+    scene_numbers = None
+    final_srt_entries = srt_entries
+
+    if args.prompt_given:
+        # Try to locate the script file
+        script_path = BASE / "prompt" / "script.txt"
+        if not script_path.exists():
+            script_path = BASE / "audio" / "script.txt"
+            
+        if script_path.exists():
+            with open(script_path, "r", encoding="utf-8") as f:
+                script_lines = [line.strip() for line in f.readlines() if line.strip()]
+                
+            if script_lines:
+                print(f"[OK] Aligned script: Loaded {len(script_lines)} lines from script.txt")
+                
+                # Check for image_prompts.txt to parse scene numbers
+                prompts_path = BASE / "prompt" / "image_prompts.txt"
+                if not prompts_path.exists():
+                    prompts_path = BASE / "captions" / "script_prompts.txt"
+                    
+                parsed_scenes = []
+                if prompts_path.exists():
+                    with open(prompts_path, "r", encoding="utf-8") as f:
+                        prompt_lines = [line.strip() for line in f.readlines() if line.strip()]
+                    
+                    for idx, line in enumerate(prompt_lines):
+                        s_num = parse_scene_number(line)
+                        if s_num is None:
+                            s_num = idx + 1
+                        parsed_scenes.append(s_num)
+                    print(f"[OK] Parsed {len(parsed_scenes)} scene numbers from prompts.")
+                
+                # If parsed_scenes count doesn't match script_lines, pad/truncate or fallback
+                # Scene number for script line j (0-based) defaults to j+1
+                scene_numbers = []
+                for idx in range(len(script_lines)):
+                    if idx < len(parsed_scenes):
+                        scene_numbers.append(parsed_scenes[idx])
+                    else:
+                        scene_numbers.append(idx + 1)
+                
+                # Align standard SRT segments to script lines
+                total_duration = AudioFileClip(str(audio_path)).duration
+                matched_indices = match_segments_to_script(srt_entries, script_lines)
+                line_times = assign_timestamps_to_lines(script_lines, srt_entries, matched_indices, total_duration)
+                
+                # Reconstruct final_srt_entries for rendering
+                final_srt_entries = []
+                for idx, line in enumerate(script_lines):
+                    start_t, end_t = line_times[idx]
+                    final_srt_entries.append((start_t, end_t, line))
+                    
+                use_prompt_matching = True
+                print(f"[Align] Aligned standard Whisper transcription to {len(script_lines)} script lines successfully.")
+            else:
+                print("[WARNING] script.txt was empty. Falling back to sequential rendering.")
+        else:
+            print("[WARNING] Could not find script.txt. Falling back to sequential rendering.")
+
+    # 5. Build video
+    build_video(
+        srt_entries=final_srt_entries, 
+        image_files=image_files, 
+        audio_path=audio_path,
+        show_subtitles=args.subtitles,
+        use_zoom=args.zoom,
+        video_size=video_size,
+        fps=FPS,
+        num_threads=args.threads,
+        use_prompt_matching=use_prompt_matching,
+        scene_numbers=scene_numbers
+    )
+
+
+if __name__ == "__main__":
+    main()
